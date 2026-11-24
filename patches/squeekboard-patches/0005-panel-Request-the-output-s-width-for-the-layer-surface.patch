@@ -1,0 +1,276 @@
+From dd346a9612d70d8138d94399240294d688a7afc0 Mon Sep 17 00:00:00 2001
+From: Gibryon Bhojraj <gibryon@treeswift.com>
+Date: Mon, 23 Nov 2026 21:27:15 -0500
+Subject: [PATCH] panel: Request the output's width for the layer surface
+
+The panel asked for a width of 0, leaving the width to the compositor.
+Before the compositor knows the size it placed the surface with,
+Mir (Ubuntu Frame) places it at its default 640x480 window size,
+so the first configure sent to the panel has a width of 0
+and the exclusive zone briefly reserves 480 pixels.
+Applications squeezed into the remaining space resize twice
+each time the panel opens: on an 800 pixel tall screen,
+to 320 and then to the correct 534.
+
+The panel always spans its output, so request that width.
+If the output's size is not known, the width stays 0 as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/animation.rs |  2 ++
+ src/panel.c      |  9 +++++----
+ src/panel.rs     | 41 +++++++++++++++++++++++++----------------
+ src/state.rs     | 18 +++++++++++++++---
+ 4 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/src/animation.rs b/src/animation.rs
+index 61b6c3f..45fed84 100644
+--- a/src/animation.rs
++++ b/src/animation.rs
+@@ -29,6 +29,8 @@ pub enum Outcome {
+     Visible {
+         output: OutputId,
+         height: PixelSize,
++        /// Width of the output. The panel spans all of it.
++        width: PixelSize,
+         contents: Contents,
+     },
+     Hidden,
+diff --git a/src/panel.c b/src/panel.c
+index a9942c8..8b947fe 100644
+--- a/src/panel.c
++++ b/src/panel.c
+@@ -58,9 +58,9 @@ make_widget (struct panel_manager *self)
+ // Called also from rust
+ /// Updates the size
+ void
+-panel_manager_resize (struct panel_manager *self, uint32_t height)
++panel_manager_resize (struct panel_manager *self, uint32_t width, uint32_t height)
+ {
+-    phosh_layer_surface_set_size(self->window, 0, height);
++    phosh_layer_surface_set_size(self->window, width, height);
+     phosh_layer_surface_set_exclusive_zone(self->window, height);
+     phosh_layer_surface_wl_surface_commit(self->window);
+ }
+@@ -68,13 +68,14 @@ panel_manager_resize (struct panel_manager *self, uint32_t height)
+ // Called from rust
+ /// Creates a new panel widget
+ void
+-panel_manager_request_widget (struct panel_manager *self, struct wl_output *output, uint32_t height, struct squeek_panel_manager *mgr)
++panel_manager_request_widget (struct panel_manager *self, struct wl_output *output, uint32_t width, uint32_t height, struct squeek_panel_manager *mgr)
+ {
+     if (!self->window) {
+         self->window = g_object_new (
+             PHOSH_TYPE_LAYER_SURFACE,
+             "layer-shell", squeek_wayland->layer_shell,
+             "wl-output", output,
++            "width", width,
+             "height", height,
+             "anchor", ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+             | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
+@@ -100,7 +101,7 @@ panel_manager_request_widget (struct panel_manager *self, struct wl_output *outp
+         gtk_window_set_icon_name (GTK_WINDOW(self->window), "squeekboard");
+         gtk_window_set_keep_above (GTK_WINDOW(self->window), TRUE);
+     } else {
+-        panel_manager_resize(self, height);
++        panel_manager_resize(self, width, height);
+     }
+ 
+     if (!self->widget) {
+diff --git a/src/panel.rs b/src/panel.rs
+index 4691b0c..2541614 100644
+--- a/src/panel.rs
++++ b/src/panel.rs
+@@ -50,11 +50,12 @@ pub mod c {
+         pub fn panel_manager_request_widget(
+             service: PanelManager,
+             output: WlOutput,
++            width: u32,
+             height: u32,
+             // for callbacks
+             panel: Wrapped<Manager>,
+         );
+-        pub fn panel_manager_resize(service: PanelManager, height: u32);
++        pub fn panel_manager_resize(service: PanelManager, width: u32, height: u32);
+         pub fn panel_manager_hide(service: PanelManager);
+     }
+ 
+@@ -124,9 +125,10 @@ enum State {
+ #[derive(Debug, PartialEq)]
+ enum Update {
+     Hide,
+-    Resize { height: u32 },
++    Resize { width: u32, height: u32 },
+     RequestWidget {
+         output: OutputId,
++        width: u32,
+         height: u32,
+     },
+ }
+@@ -136,6 +138,8 @@ pub enum Command {
+     Show {
+         output: OutputId,
+         height: PixelSize,
++        /// Zero leaves the width to the compositor.
++        width: PixelSize,
+     },
+     Hide,
+ }
+@@ -189,10 +193,10 @@ impl Manager {
+             unsafe {
+                 match update {
+                     Update::Hide => c::panel_manager_hide(mgr.panel),
+-                    Update::Resize { height }
+-                        => c::panel_manager_resize(mgr.panel, *height),
+-                    Update::RequestWidget{output, height}
+-                        => c::panel_manager_request_widget(mgr.panel, output.0, *height, copied.clone()),
++                    Update::Resize { width, height }
++                        => c::panel_manager_resize(mgr.panel, *width, *height),
++                    Update::RequestWidget{output, width, height}
++                        => c::panel_manager_request_widget(mgr.panel, output.0, *width, *height, copied.clone()),
+                 }
+             }
+         }
+@@ -241,18 +245,20 @@ impl State {
+             (Command::Hide, State::SizeRequested{..}) => (
+                 State::Hidden, vec![Update::Hide],
+             ),
+-            (Command::Show{output, height}, State::Hidden) => {
++            (Command::Show{output, height, width}, State::Hidden) => {
+                 let height = height.as_scaled_ceiling();
++                let width = width.as_scaled_floor();
+                 (
+                     State::SizeRequested{output, height},
+-                    vec![Update::RequestWidget{ output, height }],
++                    vec![Update::RequestWidget{ output, width, height }],
+                 )
+             },
+             (
+-                Command::Show{output, height},
++                Command::Show{output, height, width},
+                 State::SizeRequested{output: req_output, height: req_height},
+             ) => {
+                 let height = height.as_scaled_ceiling();
++                let width = width.as_scaled_floor();
+                 if output == req_output && height == req_height {(
+                     State::SizeRequested{output: req_output, height: req_height},
+                     Vec::new(),
+@@ -270,7 +276,7 @@ impl State {
+                     // so instead always listen to the higher layer and request a new size.
+                     // If this causes problems, maybe count requests/configures, or track what was allocated in response to what request.
+                     State::SizeRequested{output, height},
+-                    vec![Update::Resize { height }],
++                    vec![Update::Resize { width, height }],
+                 )} else {(
+                     // This looks weird, but should be safe.
+                     // The stack seems to handle
+@@ -278,15 +284,16 @@ impl State {
+                     State::SizeRequested{output, height},
+                     vec![
+                         Update::Hide,
+-                        Update::RequestWidget { output, height },
++                        Update::RequestWidget { output, width, height },
+                     ],
+                 )}
+             },
+             (
+-                Command::Show{output, height},
++                Command::Show{output, height, width},
+                 State::SizeAllocated{output: alloc_output, allocated, wanted_height},
+             ) => {
+                 let height = height.as_scaled_ceiling();
++                let width = width.as_scaled_floor();
+                 if output == alloc_output && height == wanted_height {(
+                     State::SizeAllocated{output: alloc_output, wanted_height, allocated},
+                     Vec::new(),
+@@ -297,12 +304,12 @@ impl State {
+                     // Should *all* other heights cause a resize?
+                     // What about those between wanted and allocated?
+                     State::SizeRequested{output, height},
+-                    vec![Update::Resize{height}],
++                    vec![Update::Resize{width, height}],
+                 )} else {(
+                     State::SizeRequested{output, height},
+                     vec![
+                         Update::Hide,
+-                        Update::RequestWidget{output, height},
++                        Update::RequestWidget{output, width, height},
+                     ]
+                    )}
+             },
+@@ -327,10 +334,11 @@ mod tests {
+         let (state, cmds) = state.update(Command::Show {
+             output,
+             height: PixelSize { pixels: 100, scale_factor: 1 },
++            width: PixelSize { pixels: 720, scale_factor: 1 },
+         });
+         assert_eq!(
+             cmds,
+-            vec![Update::RequestWidget { output, height: 100 }],
++            vec![Update::RequestWidget { output, width: 720, height: 100 }],
+         );
+         // layer shell requests a resize
+ 
+@@ -338,10 +346,11 @@ mod tests {
+         let (state, cmds) = dbg!(state).update(Command::Show {
+             output,
+             height: PixelSize { pixels: 50, scale_factor: 1 },
++            width: PixelSize { pixels: 720, scale_factor: 1 },
+         });
+         assert_eq!(
+             cmds,
+-            vec![Update::Resize { height: 50 }],
++            vec![Update::Resize { width: 720, height: 50 }],
+             "{:?}",
+             state,
+         );
+diff --git a/src/state.rs b/src/state.rs
+index 4a4ad2f..7b76584 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -146,8 +146,8 @@ impl event_loop::Outcome for Outcome {
+     fn get_commands_to_reach(&self, new_state: &Self) -> Commands {
+ // FIXME: handle switching outputs
+         let (dbus_visible_set, panel_visibility) = match new_state.panel {
+-            animation::Outcome::Visible{output, height, ..}
+-                => (Some(true), Some(panel::Command::Show{output, height})),
++            animation::Outcome::Visible{output, height, width, ..}
++                => (Some(true), Some(panel::Command::Show{output, height, width})),
+             animation::Outcome::Hidden => (Some(false), Some(panel::Command::Hide)),
+         };
+ 
+@@ -480,11 +480,22 @@ impl ActorState for Application {
+             panel: match self.preferred_output {
+                 None => animation::Outcome::Hidden,
+                 Some(output) => {
+-                    let (height, arrangement) = Self::get_preferred_height_and_arrangement(self.outputs.get(&output).unwrap())
++                    let output_state = self.outputs.get(&output).unwrap();
++                    let (height, arrangement) = Self::get_preferred_height_and_arrangement(output_state)
+                         .unwrap_or((
+                             PixelSize{pixels: 0, scale_factor: 1},
+                             ArrangementKind::Base,
+                         ));
++                    // The panel spans the output. Requesting that width,
++                    // rather than leaving it to the compositor,
++                    // lets the compositor place the panel and its exclusive zone correctly
++                    // from the first commit.
++                    let width = output_state.get_pixel_size()
++                        .map(|px_size| PixelSize{
++                            pixels: px_size.width,
++                            scale_factor: output_state.scale as u32,
++                        })
++                        .unwrap_or(PixelSize{pixels: 0, scale_factor: 1});
+                     let (layout_name, overlay) = self.get_layout_names();
+         
+                     // TODO: Instead of setting size to 0 when the output is invalid,
+@@ -492,6 +503,7 @@ impl ActorState for Application {
+                     let visible = animation::Outcome::Visible{
+                         output,
+                         height,
++                        width,
+                         contents: animation::Contents {
+                             kind: arrangement,
+                             name: layout_name,
+-- 
+2.56.0
+
